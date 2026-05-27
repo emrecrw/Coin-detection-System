@@ -1,0 +1,131 @@
+import cv2 as cv
+import numpy as np
+import json
+import sys
+from pathlib import Path
+
+DEFAULT_PARAMS = {
+    "blur_k":   11,
+    "dilat_k":  7,
+    "eros_k":   11,
+    "canny_t":  66.2,
+    "hough_s":  52.37,
+    "dist_min": 51.4,
+    "r_max":    234.8,
+}
+
+#  DÉTECTION  
+def _detecter_cercles(canal_gris, blur_k, dilat_k, eros_k, canny_t, hough_s, dist_min, r_max, nom_canal=''):
+    k = int(blur_k)
+    if k % 2 == 0:
+        k += 1
+    img_lisse = cv.GaussianBlur(canal_gris, (k, k), 0)
+    noyau_dilatation = cv.getStructuringElement(cv.MORPH_ELLIPSE, (int(dilat_k), int(dilat_k)))
+    noyau_erosion    = cv.getStructuringElement(cv.MORPH_ELLIPSE, (int(eros_k),  int(eros_k)))
+    img_morpho       = cv.dilate(img_lisse, noyau_dilatation)
+    img_morpho       = cv.erode(img_morpho, noyau_erosion)
+    circles = cv.HoughCircles(
+        img_morpho, cv.HOUGH_GRADIENT,
+        dp=1.2, minDist=dist_min, param1=canny_t, param2=hough_s,
+        minRadius=25, maxRadius=int(r_max)
+    )
+    return _filtrer_resultats(circles, img_morpho, nom_canal), img_morpho, img_lisse
+
+
+def _filtrer_resultats(circles, img_ref, nom_canal=''):
+    if circles is None:
+        return None
+    circles        = np.uint16(np.around(circles))
+    sorted_circles = sorted(circles[0, :], key=lambda x: x[2], reverse=True)
+    h, w           = img_ref.shape[:2]
+    cx, cy         = w / 2, h / 2
+    plus_grand     = sorted_circles[0]
+    px, py, pr     = int(plus_grand[0]), int(plus_grand[1]), int(plus_grand[2])
+    dist_centre    = np.sqrt((px - cx)**2 + (py - cy)**2)
+    est_grand      = pr > min(h, w) * 0.20
+    est_centre     = dist_centre < min(h, w) * 0.45
+
+    if nom_canal != 'HSV_V' and est_grand and est_centre:
+        y1, y2 = max(0, py - pr), min(h, py + pr)
+        x1, x2 = max(0, px - pr), min(w, px + pr)
+        roi    = img_ref[y1:y2, x1:x2]
+        rh, rw = roi.shape[:2]
+        masque = np.zeros((rh, rw), dtype=np.uint8)
+        cv.circle(masque, (rw // 2, rh // 2), min(rw, rh) // 2, 255, -1)
+        pixels = roi[masque == 255]
+        if pixels.size > 0 and np.std(pixels) > 8:
+            return np.array([[plus_grand]])
+
+    valides = []
+    for c in sorted_circles:
+        x, y, r = int(c[0]), int(c[1]), int(c[2])
+        if any(np.sqrt((x - int(v[0]))**2 + (y - int(v[1]))**2) < v[2] * 0.9 for v in valides):
+            continue
+        y1, y2 = max(0, y - r), min(img_ref.shape[0], y + r)
+        x1, x2 = max(0, x - r), min(img_ref.shape[1], x + r)
+        roi     = img_ref[y1:y2, x1:x2]
+        if roi.size > 0 and np.std(roi) > 6:
+            valides.append(c)
+    return np.array([valides]) if valides else None
+
+
+def _choisir_meilleur_canal(img_bgr, blur_k, dilat_k, eros_k, canny_t, hough_s, dist_min, r_max):
+    lab = cv.cvtColor(img_bgr, cv.COLOR_BGR2LAB)
+    hsv = cv.cvtColor(img_bgr, cv.COLOR_BGR2HSV)
+    canal_lab  = cv.normalize(lab[:, :, 0], None, 0, 255, cv.NORM_MINMAX)
+    canal_hsvs = cv.normalize(hsv[:, :, 1], None, 0, 255, cv.NORM_MINMAX)
+    res_lab,  morpho_lab,  _ = _detecter_cercles(canal_lab,  blur_k, dilat_k, eros_k, canny_t, hough_s, dist_min, r_max)
+    res_hsvs, morpho_hsvs, _ = _detecter_cercles(canal_hsvs, blur_k, dilat_k, eros_k, canny_t, hough_s, dist_min, r_max)
+    n_lab  = len(res_lab[0])  if res_lab  is not None else 0
+    n_hsvs = len(res_hsvs[0]) if res_hsvs is not None else 0
+    plausible_lab  = 1 <= n_lab  <= 17
+    plausible_hsvs = 1 <= n_hsvs <= 17
+    a_moy      = np.mean(lab[:, :, 1].astype(float)) - 128
+    b_moy      = np.mean(lab[:, :, 2].astype(float)) - 128
+    fond_chaud = a_moy > 5 and b_moy > 12
+    if fond_chaud:
+        canal_hsvv               = cv.normalize(hsv[:, :, 2], None, 0, 255, cv.NORM_MINMAX)
+        res_hsvv, morpho_hsvv, _ = _detecter_cercles(canal_hsvv, blur_k, dilat_k, eros_k, canny_t, hough_s, dist_min, r_max, 'HSV_V')
+        n_hsvv = len(res_hsvv[0]) if res_hsvv is not None else 0
+        if 1 <= n_hsvv <= 17 and n_hsvv >= n_lab and n_hsvv <= n_lab + 2:
+            return res_hsvv, morpho_hsvv, canal_hsvv, n_hsvv, 'HSV_V'
+    if plausible_lab and not plausible_hsvs:
+        return res_lab, morpho_lab, canal_lab, n_lab, 'LAB_L'
+    elif plausible_hsvs and not plausible_lab:
+        return res_hsvs, morpho_hsvs, canal_hsvs, n_hsvs, 'HSV_S'
+    elif plausible_lab and plausible_hsvs:
+        return (res_lab, morpho_lab, canal_lab, n_lab, 'LAB_L') if n_lab >= n_hsvs else (res_hsvs, morpho_hsvs, canal_hsvs, n_hsvs, 'HSV_S')
+    return res_lab, morpho_lab, canal_lab, n_lab, 'LAB_L*'
+
+
+#  FONCTION PUBLIQUE
+def detect_coins(image_path: str, params: dict = None) -> dict:
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    img_bgr = cv.imread(str(image_path))
+    if img_bgr is None:
+        return {"count": 0, "circles": [], "canal": None, "image_size": None,
+                "error": f"Impossible de lire l'image : {image_path}"}
+    h_orig, w_orig = img_bgr.shape[:2]
+    new_h = int(750 * h_orig / w_orig)
+    img_bgr = cv.resize(img_bgr, (750, new_h))
+    try:
+        circles, _, _, count, canal = _choisir_meilleur_canal(
+            img_bgr, p["blur_k"], p["dilat_k"], p["eros_k"],
+            p["canny_t"], p["hough_s"], p["dist_min"], p["r_max"]
+        )
+    except Exception as exc:
+        return {"count": 0, "circles": [], "canal": None,
+                "image_size": {"width": 750, "height": new_h}, "error": str(exc)}
+    circles_list = []
+    if circles is not None:
+        for c in circles[0]:
+            circles_list.append({"x": int(c[0]), "y": int(c[1]), "r": int(c[2])})
+    return {"count": count, "circles": circles_list, "canal": canal,
+            "image_size": {"width": 750, "height": new_h}, "error": None}
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage : python detector.py <image_path>")
+        sys.exit(1)
+    print(json.dumps(detect_coins(sys.argv[1]), indent=2, ensure_ascii=False))

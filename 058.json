@@ -1,0 +1,395 @@
+import cv2 as cv
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider, Button
+import os
+import glob
+import json
+from pathlib import Path
+
+# Racine du projet : algo.py est dans src/non_supervise/, donc on remonte de 3 niveaux
+BASE_DIR            = Path(__file__).resolve().parent.parent.parent
+DOSSIER_IMAGES      = BASE_DIR / "bdd" / "Test_Base" / "Images"
+DOSSIER_ANNOTATIONS = BASE_DIR / "bdd" / "Annotation" / "Nv_Annotations"
+
+#  DÉTECTION DE CERCLES
+def detecter_cercles(canal_gris, blur_k, dilat_k, eros_k, canny_t, hough_s, dist_min, r_max, nom_canal=''):
+    """
+    Prend un canal en niveaux de gris et retourne les cercles détectés.
+    Étapes : flou --> morphologie --> Hough --> filtrage.
+    """
+
+    # Le noyau de flou 
+    k = int(blur_k)
+    if k % 2 == 0:
+        k += 1
+    img_lisse = cv.GaussianBlur(canal_gris, (k, k), 0)
+
+    # Morphologie : dilatation puis érosion
+    noyau_dilatation = cv.getStructuringElement(cv.MORPH_ELLIPSE, (int(dilat_k), int(dilat_k)))
+    noyau_erosion    = cv.getStructuringElement(cv.MORPH_ELLIPSE, (int(eros_k),  int(eros_k)))
+    img_morpho       = cv.dilate(img_lisse, noyau_dilatation)
+    img_morpho       = cv.erode(img_morpho, noyau_erosion)
+
+    # Détection des cercles
+    circles = cv.HoughCircles(
+        img_morpho,
+        cv.HOUGH_GRADIENT,
+        dp        = 1.2,
+        minDist   = dist_min,
+        param1    = canny_t,
+        param2    = hough_s,
+        minRadius = 25,
+        maxRadius = int(r_max)
+    )
+
+    circles_filtres = filtrer_resultats(circles, img_morpho, nom_canal)
+    return circles_filtres, img_morpho, img_lisse
+
+
+def filtrer_resultats(circles, img_ref, nom_canal=''):
+    """
+    Nettoie les cercles bruts détectés par Hough.
+
+    Règle 1 : si un seul grand cercle bien centré existe --> c'est une pièce unique, on le retourne seul.
+    Règle 2 : sinon, on parcourt tous les cercles et on supprime :
+              - les doublons (deux cercles qui se chevauchent trop)
+              - les faux positifs (zones trop uniformes = fond de l'image)
+    """
+
+    if circles is None:
+        return None
+
+    circles        = np.uint16(np.around(circles))
+    sorted_circles = sorted(circles[0, :], key=lambda x: x[2], reverse=True)
+
+    h, w           = img_ref.shape[:2]
+    centre_x_image = w / 2
+    centre_y_image = h / 2
+
+    plus_grand  = sorted_circles[0]
+    px          = int(plus_grand[0])
+    py          = int(plus_grand[1])
+    pr          = int(plus_grand[2])
+    dist_centre = np.sqrt((px - centre_x_image)**2 + (py - centre_y_image)**2)
+
+    est_grand  = pr > min(h, w) * 0.20
+    est_centre = dist_centre < min(h, w) * 0.45
+
+    # Règle 1 : pièce unique grande et centrée
+    if nom_canal != 'HSV_V' and est_grand and est_centre:
+        y1, y2 = max(0, py - pr), min(h, py + pr)
+        x1, x2 = max(0, px - pr), min(w, px + pr)
+        roi    = img_ref[y1:y2, x1:x2]
+        rh, rw = roi.shape[:2]
+        masque = np.zeros((rh, rw), dtype=np.uint8)
+        cv.circle(masque, (rw // 2, rh // 2), min(rw, rh) // 2, 255, -1)
+        pixels = roi[masque == 255]
+        if pixels.size > 0 and np.std(pixels) > 8:
+            return np.array([[plus_grand]])
+        # std trop faible → fond, pas une pièce → Règle 2
+
+    # Règle 2 : dédoublonnage + rejet fond
+    valides = []
+    for c in sorted_circles:
+        x, y, r = int(c[0]), int(c[1]), int(c[2])
+
+        est_doublon = False
+        for v in valides:
+            if np.sqrt((x - int(v[0]))**2 + (y - int(v[1]))**2) < v[2] * 0.9:
+                est_doublon = True
+                break
+        if est_doublon:
+            continue
+
+        y1, y2 = max(0, y - r), min(img_ref.shape[0], y + r)
+        x1, x2 = max(0, x - r), min(img_ref.shape[1], x + r)
+        roi     = img_ref[y1:y2, x1:x2]
+
+        if roi.size > 0 and np.std(roi) <= 6:
+            continue
+        if roi.size > 0 and np.std(roi) > 6:
+            valides.append(c)
+
+    return np.array([valides]) if valides else None
+
+
+#  SÉLECTION DU MEILLEUR CANAL  
+def est_fond_chaud(img_bgr):
+    """
+    Regarde si l'image a un fond à dominante chaude (ex : table en bois).
+    """
+    lab   = cv.cvtColor(img_bgr, cv.COLOR_BGR2LAB)
+    a_moy = np.mean(lab[:, :, 1].astype(float)) - 128
+    b_moy = np.mean(lab[:, :, 2].astype(float)) - 128
+    return a_moy > 5 and b_moy > 15
+
+
+def choisir_meilleur_canal(img_bgr, blur_k, dilat_k, eros_k, canny_t, hough_s, dist_min, r_max):
+    """
+    Teste différents canaux de couleur et choisit celui qui donne
+    un nombre de pièces plausible (entre 1 et 17).
+
+    Canaux testés :
+      - LAB_L  : luminosité (CIE L*), fonctionne bien sur fond neutre
+      - HSV_S  : saturation, utile si les pièces ont des couleurs vives
+      - HSV_V  : luminosité HSV, prioritaire si le fond est chaud (bois…)
+    """
+
+    # Conversion de l'image dans les espaces LAB et HSV
+    lab = cv.cvtColor(img_bgr, cv.COLOR_BGR2LAB)
+    hsv = cv.cvtColor(img_bgr, cv.COLOR_BGR2HSV)
+
+    # Extraction et normalisation des canaux à tester
+    canal_lab  = cv.normalize(lab[:, :, 0], None, 0, 255, cv.NORM_MINMAX)
+    canal_hsvs = cv.normalize(hsv[:, :, 1], None, 0, 255, cv.NORM_MINMAX)
+
+    # Détection sur chaque canal
+    res_lab,  morpho_lab,  _ = detecter_cercles(canal_lab,  blur_k, dilat_k, eros_k, canny_t, hough_s, dist_min, r_max)
+    res_hsvs, morpho_hsvs, _ = detecter_cercles(canal_hsvs, blur_k, dilat_k, eros_k, canny_t, hough_s, dist_min, r_max)
+
+    n_lab  = len(res_lab[0])  if res_lab  is not None else 0
+    n_hsvs = len(res_hsvs[0]) if res_hsvs is not None else 0
+
+    plausible_lab  = 1 <= n_lab  <= 17
+    plausible_hsvs = 1 <= n_hsvs <= 17
+
+    a_moy      = np.mean(lab[:, :, 1].astype(float)) - 128
+    b_moy      = np.mean(lab[:, :, 2].astype(float)) - 128
+    fond_chaud = a_moy > 5 and b_moy > 12
+
+    if fond_chaud:
+        canal_hsvv               = cv.normalize(hsv[:, :, 2], None, 0, 255, cv.NORM_MINMAX)
+        res_hsvv, morpho_hsvv, _ = detecter_cercles(canal_hsvv, blur_k, dilat_k, eros_k, canny_t, hough_s, dist_min, r_max, 'HSV_V')
+        n_hsvv = len(res_hsvv[0]) if res_hsvv is not None else 0
+
+        if 1 <= n_hsvv <= 17 and n_hsvv >= n_lab and n_hsvv <= n_lab + 2:
+            return res_hsvv, morpho_hsvv, canal_hsvv, n_hsvv, 'HSV_V'
+
+    if plausible_lab and not plausible_hsvs:
+        return res_lab, morpho_lab, canal_lab, n_lab, 'LAB_L'
+    elif plausible_hsvs and not plausible_lab:
+        return res_hsvs, morpho_hsvs, canal_hsvs, n_hsvs, 'HSV_S'
+    elif plausible_lab and plausible_hsvs:
+        if n_lab >= n_hsvs:
+            return res_lab,  morpho_lab,  canal_lab,  n_lab,  'LAB_L'
+        else:
+            return res_hsvs, morpho_hsvs, canal_hsvs, n_hsvs, 'HSV_S'
+    else:
+        return res_lab, morpho_lab, canal_lab, n_lab, 'LAB_L*'
+
+
+#  INTERFACE GRAPHIQUE  
+def detecteur_pieces(folder_path=DOSSIER_IMAGES):
+    """
+    Lance l'interface avec :
+      - 4 vues : canal source / lissage / morpho / résultat
+      - Sliders pour ajuster les paramètres en direct
+      - Boutons Préc / Suiv pour naviguer entre les images
+      - Bouton LANCER ANALYSE pour calculer Score, MAE, MSE, F1
+      - Bouton ERREURS pour voir uniquement les images ratées
+    """
+
+    # Chargement de toutes les images du dossier
+    all_paths = sorted(
+        glob.glob(os.path.join(folder_path, "*.jpeg")) +
+        glob.glob(os.path.join(folder_path, "*.png"))
+    )
+    if not all_paths:
+        print("Dossier vide !")
+        return
+
+    # Dictionnaire d'état partagé entre tous les boutons/callbacks
+    state = {'paths': all_paths, 'idx': 0, 'errors': []}
+
+    # Mise en page
+    fig, axes = plt.subplots(1, 4, figsize=(18, 6))
+    plt.subplots_adjust(bottom=0.28, top=0.92, wspace=0.05)
+
+    # Sliders
+    s_blur  = Slider(plt.axes([0.08, 0.16, 0.18, 0.025]), 'Flou',       1,   41,  valinit=11,   valstep=2)
+    s_dilat = Slider(plt.axes([0.08, 0.11, 0.18, 0.025]), 'Dilation',   1,   31,  valinit=7,    valstep=1)
+    s_eros  = Slider(plt.axes([0.35, 0.16, 0.18, 0.025]), 'Erosion',    1,   31,  valinit=11,   valstep=1)
+    s_can   = Slider(plt.axes([0.35, 0.11, 0.18, 0.025]), 'Canny',      10,  250, valinit=66.2)
+    s_sens  = Slider(plt.axes([0.62, 0.16, 0.15, 0.025]), 'Hough Sens', 5,   100, valinit=52.37)
+    s_dist  = Slider(plt.axes([0.62, 0.11, 0.15, 0.025]), 'Min Dist',   10,  200, valinit=51.4)
+    s_max   = Slider(plt.axes([0.82, 0.11, 0.12, 0.025]), 'Max Rayon',  50,  400, valinit=234.8)
+
+    # Zone de texte en bas de la figure pour afficher les métriques après analyse
+    score_text = fig.text(0.08, 0.065, '', fontsize=9, color='#222222',
+                          family='monospace', verticalalignment='top')
+
+    def update(val=None):
+        """
+        Cette fonction est appelée à chaque déplacement de slider ou changement d'image.
+        Elle relit l'image courante, lance la détection et met à jour les 4 vues.
+        """
+        # Lecture et redimensionnement de l'image courante
+        img_bgr  = cv.imread(state['paths'][state['idx']])
+        img_bgr  = cv.resize(img_bgr, (750, int(750 * img_bgr.shape[0] / img_bgr.shape[1])))
+        filename = os.path.basename(state['paths'][state['idx']])
+
+        # Détection avec les valeurs actuelles des sliders
+        circles, morpho, source, count, nom = choisir_meilleur_canal(
+            img_bgr,
+            s_blur.val, s_dilat.val, s_eros.val,
+            s_can.val,  s_sens.val,  s_dist.val, s_max.val
+        )
+
+        # Dessin des cercles détectés sur une copie de l'image
+        res = img_bgr.copy()
+        if circles is not None:
+            for c in circles[0]:
+                cv.circle(res, (c[0], c[1]), c[2], (0, 255, 0), 3)
+                cv.circle(res, (c[0], c[1]), 3,    (0, 0, 255), -1)
+
+        # Couleur du titre selon le canal utilisé
+        couleur_titre = 'steelblue' if 'LAB' in nom else 'darkorange'
+        titres = [f'{nom} — {filename}', 'Lissage', 'Morpho (D+E)', f'Détecté : {count}']
+        imgs   = [source, morpho, morpho, cv.cvtColor(res, cv.COLOR_BGR2RGB)]
+        cmaps  = ['gray', 'gray', 'gray', None]
+
+        for i, ax in enumerate(axes):
+            ax.clear()
+            ax.axis('off')
+            ax.set_title(titres[i], fontsize=9, pad=4,
+                         color=couleur_titre if i == 0 else 'black')
+            if cmaps[i] is not None:
+                ax.imshow(imgs[i], cmap=cmaps[i])
+            else:
+                ax.imshow(imgs[i])
+
+        fig.canvas.draw_idle()
+
+    def lancer_analyse(event):
+        """
+        Parcourt toutes les images, compare le nombre de pièces détectées
+        à la vérité terrain (fichiers JSON), puis affiche les métriques.
+        """
+
+        # On prend un snapshot des sliders au moment du clic
+        params = {
+            'blur': s_blur.val, 'dilat': s_dilat.val, 'eros': s_eros.val,
+            'can':  s_can.val,  'sens':  s_sens.val,  'dist': s_dist.val,
+            'max':  s_max.val
+        }
+
+        # Réinitialisation des compteurs
+        state['errors'] = []
+        correct     = 0
+        canal_stats = {'LAB_L': 0, 'HSV_S': 0, 'LAB_L*': 0}
+        tous_gt     = []
+        tous_trouve = []
+
+        print("\n" + "="*55 + "\n🚀 BILAN DE PERFORMANCE\n" + "="*55)
+
+        for p in all_paths:
+            name = os.path.basename(p).split('.')[0]
+            img  = cv.imread(p)
+            img  = cv.resize(img, (750, int(750 * img.shape[0] / img.shape[1])))
+
+            # Détection avec les paramètres snapshotés
+            circles, _, _, n_final, nom = choisir_meilleur_canal(
+                img,
+                params['blur'], params['dilat'], params['eros'],
+                params['can'],  params['sens'],  params['dist'], params['max']
+            )
+            canal_stats[nom] = canal_stats.get(nom, 0) + 1
+
+            # Lecture du nombre de pièces attendu depuis le fichier JSON
+            json_p = os.path.join(DOSSIER_ANNOTATIONS, name + '.json')
+            gt = 0
+            if os.path.exists(json_p):
+                with open(json_p, 'r') as f:
+                    gt = len(json.load(f).get('shapes', []))
+
+            tous_gt.append(gt)
+            tous_trouve.append(n_final)
+
+            # Comparaison détecté vs attendu
+            win = (n_final == gt)
+            if win:
+                correct += 1
+            else:
+                state['errors'].append(p)
+
+            print(f"Image {name:<12} | Attendu: {gt:<2} | Trouvé: {n_final:<2} | Canal: {nom:<7} | {'✅' if win else '❌'}")
+
+        # Calcul des métriques
+        score    = (correct / len(all_paths)) * 100
+        mae      = np.mean([abs(t - g) for t, g in zip(tous_trouve, tous_gt)])
+        mse      = np.mean([(t - g)**2  for t, g in zip(tous_trouve, tous_gt)])
+
+        # F1 par image : moyenne harmonique de précision et rappel
+        f1s = []
+        for t, g in zip(tous_trouve, tous_gt):
+            if g == 0 and t == 0:   f1s.append(1.0)
+            elif g == 0 or t == 0:  f1s.append(0.0)
+            else:
+                p_ = min(t, g) / t
+                r_ = min(t, g) / g
+                f1s.append(2 * p_ * r_ / (p_ + r_) if (p_ + r_) > 0 else 0.0)
+
+        f1_moyen = np.mean(f1s)
+
+        print(f"\n{'='*55}")
+        print(f"SCORE FINAL (exact)  : {score:.2f}%")
+        print(f"MAE                  : {mae:.3f}  (erreur absolue moyenne)")
+        print(f"MSE                  : {mse:.3f}  (erreur quadratique moyenne)")
+        print(f"F1 moyen             : {f1_moyen:.3f}  (moyenne harmonique précision/rappel)")
+        print(f"Canaux utilisés      : {canal_stats}")
+        print(f"{'='*55}")
+
+        # Affichage des métriques dans la figure
+        score_text.set_text(
+            f" Score exact : {score:.2f}%     MAE : {mae:.3f}     "
+            f"MSE : {mse:.3f}     F1 : {f1_moyen:.3f}     "
+            f"LAB={canal_stats['LAB_L']}  HSV={canal_stats.get('HSV_S',0)}  LAB*={canal_stats.get('LAB_L*',0)}"
+        )
+
+        # Afficher le bouton erreurs seulement s'il y en a
+        if state['errors']:
+            btn_err.ax.set_visible(True)
+            btn_err.label.set_text(f"ERREURS ({len(state['errors'])})")
+        else:
+            btn_err.ax.set_visible(False)
+
+        fig.canvas.draw_idle()
+
+    def image_precedente(event):
+        state['idx'] = (state['idx'] - 1) % len(state['paths'])
+        update()
+
+    def image_suivante(event):
+        state['idx'] = (state['idx'] + 1) % len(state['paths'])
+        update()
+
+    def basculer_erreurs(event):
+        """
+        Premier clic  --> affiche uniquement les images en erreur.
+        Deuxième clic --> revient à la liste complète.
+        """
+        if state['paths'] == all_paths:
+            state['paths'] = state['errors']
+            btn_err.label.set_text("VOIR TOUT")
+        else:
+            state['paths'] = all_paths
+            btn_err.label.set_text(f"ERREURS ({len(state['errors'])})")
+        state['idx'] = 0
+        update()
+
+    # Boutons
+    btn_p   = Button(plt.axes([0.35, 0.02, 0.08, 0.05]), '<< Préc')
+    btn_n   = Button(plt.axes([0.44, 0.02, 0.08, 0.05]), 'Suiv >>')
+    btn_a   = Button(plt.axes([0.55, 0.02, 0.14, 0.05]), 'LANCER ANALYSE', color='#2ecc71')
+    btn_err = Button(plt.axes([0.71, 0.02, 0.12, 0.05]), 'ERREURS',        color='#e74c3c')
+    btn_err.ax.set_visible(False)
+
+    btn_p.on_clicked(image_precedente)
+    btn_n.on_clicked(image_suivante)
+    btn_a.on_clicked(lancer_analyse)
+    btn_err.on_clicked(basculer_erreurs)
+
+    # Chaque déplacement de slider déclenche un rafraîchissement de l'affichage
+    for s in [s_blur, s_dilat, s_eros, s_can, s_sens, s_dist, s_max]:
+        s
